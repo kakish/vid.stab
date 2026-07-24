@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 3.14)
+cmake_minimum_required (VERSION 3.16)
 project (vid.stab C)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/")
@@ -7,6 +7,28 @@ include (FindSSE)
 include (GNUInstallDirs)
 # include (ExternalProject) # There must be a nicer way to include this
 # include (sse2neon)
+
+# AppleClang does not ship its own OpenMP runtime (unlike upstream Clang),
+# so find_package(OpenMP) fails out of the box on macOS even when OpenMP
+# support is perfectly usable via Homebrew's libomp. Point CMake at it
+# explicitly before searching, when available -- this only takes effect
+# if find_package(OpenMP) would otherwise fail, since it lets FindOpenMP's
+# own compile checks confirm the flags actually work.
+if(APPLE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+  find_program(HOMEBREW_EXECUTABLE brew)
+  if(HOMEBREW_EXECUTABLE)
+    execute_process(COMMAND ${HOMEBREW_EXECUTABLE} --prefix libomp
+                     OUTPUT_VARIABLE HOMEBREW_LIBOMP_PREFIX
+                     OUTPUT_STRIP_TRAILING_WHITESPACE
+                     RESULT_VARIABLE HOMEBREW_LIBOMP_RESULT
+                     ERROR_QUIET)
+    if(HOMEBREW_LIBOMP_RESULT EQUAL 0 AND EXISTS "${HOMEBREW_LIBOMP_PREFIX}/include/omp.h")
+      set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp -I${HOMEBREW_LIBOMP_PREFIX}/include")
+      set(OpenMP_C_LIB_NAMES "omp")
+      set(OpenMP_omp_LIBRARY "${HOMEBREW_LIBOMP_PREFIX}/lib/libomp.dylib")
+    endif()
+  endif()
+endif()
 find_package(OpenMP)
 
 set(MAJOR_VERSION 1)
@@ -23,6 +45,15 @@ option(BUILD_SHARED_LIBS "build shared libraries instead of static libraries"
        ON)
 
 option(USE_OMP "use parallelization use OMP" ON)
+
+option(USE_MPS "Enable Apple Metal Performance Shaders acceleration" ON)
+if(USE_MPS AND NOT APPLE)
+  set(USE_MPS OFF)
+endif()
+if(USE_MPS)
+  enable_language(OBJCXX)
+  add_definitions(-DUSE_MPS)
+endif()
 
 set(CMAKE_C_STANDARD 99)
 
@@ -68,6 +99,11 @@ set(HEADERS src/frameinfo.h src/transformtype.h src/libvidstab.h
   src/transform.h src/motiondetect.h src/serialize.h
   src/localmotion2transform.h src/boxblur.h src/vsvector.h )
 
+if(USE_MPS)
+  list(APPEND SOURCES src/motiondetect_mps.mm)
+  list(APPEND HEADERS src/motiondetect_mps.h)
+endif()
+
 
 # Create the vidstab library
 add_library (vidstab ${SOURCES})
@@ -91,6 +127,17 @@ if(TARGET OpenMP::OpenMP_C)
 target_link_libraries(vidstab OpenMP::OpenMP_C)
 endif()
 set(PKG_EXTRA_LIBS "${PKG_EXTRA_LIBS} ${OpenMP_C_FLAGS}")
+endif()
+
+if(USE_MPS)
+  set_source_files_properties(src/motiondetect_mps.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  # NOTE: plain (non-keyword) signature, matching the other
+  # target_link_libraries(vidstab ...) calls above -- CMake does not allow
+  # mixing plain and PRIVATE/PUBLIC/INTERFACE keyword signatures for the
+  # same target within a directory scope.
+  target_link_libraries(vidstab "-framework Metal"
+                                 "-framework MetalPerformanceShaders"
+                                 "-framework Foundation")
 endif()
 
 

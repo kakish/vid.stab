@@ -27,11 +27,15 @@
 #include "motiondetect.h"
 #include "motiondetect_internal.h"
 #include "motiondetect_opt.h"
+#include "motiondetect_mps.h"
 #include <math.h>
 #include <limits.h>
 #include <stdint.h>
 #include <string.h>
 #include <assert.h>
+#ifdef USE_MPS
+#include <time.h>
+#endif
 
 #ifdef USE_OMP
 #include <omp.h>
@@ -54,7 +58,6 @@ typedef struct _contrast_idx {
   int index;
 } contrast_idx;
 
-
 VSMotionDetectConfig vsMotionDetectGetDefaultConfig(const char* modName){
   VSMotionDetectConfig conf;
   conf.stepSize          = 6;
@@ -65,6 +68,7 @@ VSMotionDetectConfig vsMotionDetectGetDefaultConfig(const char* modName){
   conf.show              = 0;
   conf.modName           = modName;
   conf.numThreads        = 0;
+  conf.accelMode         = VSAccelAuto;
   return conf;
 }
 
@@ -150,11 +154,34 @@ int vsMotionDetectInit(VSMotionDetect* md, const VSMotionDetectConfig* conf, con
   vsFrameAllocate(&md->curr,&md->fi);
   vsFrameAllocate(&md->currtmp, &md->fi);
 
+#ifdef USE_MPS
+  md->mpsAccel = NULL;
+  if (md->conf.accelMode != VSAccelCPU && md->fi.pFormat <= PF_PACKED) {
+    md->mpsAccel = vsMPSAccelCreate();
+    if (md->mpsAccel) {
+      vs_log_info(md->conf.modName, "Using Apple Metal (MPS) acceleration for motion detection\n");
+    } else if (md->conf.accelMode == VSAccelMPS) {
+      vs_log_warn(md->conf.modName,
+                  "Apple Metal (MPS) acceleration requested but not available -- falling back to CPU\n");
+    } else {
+      vs_log_info(md->conf.modName, "Apple Metal (MPS) acceleration not available -- using CPU\n");
+    }
+  }
+#else
+  md->mpsAccel = NULL;
+#endif
+
   md->initialized = 2;
   return VS_OK;
 }
 
 void vsMotionDetectionCleanup(VSMotionDetect* md) {
+#ifdef USE_MPS
+  if(md->mpsAccel){
+    vsMPSAccelDestroy((VSMPSAccel*)md->mpsAccel);
+    md->mpsAccel=NULL;
+  }
+#endif
   if(md->fieldscoarse.fields) {
     vs_free(md->fieldscoarse.fields);
     md->fieldscoarse.fields=0;
@@ -377,6 +404,34 @@ double contrastSubImg(unsigned char* const I, const Field* field, int width,
   return (maxi - mini) / (maxi + mini + 0.1); // +0.1 to avoid division by 0
 }
 
+/* calculates the offset that has to be applied to a field's search
+ * position (e.g. from a coarse scan transform), and checks whether the
+ * field, together with its full search window (maxShift+stepSize), still
+ * lies fully within the frame.
+ * @return 0 if the field has to be rejected (out of frame), 1 otherwise.
+ *         *offset is filled in either way (0,0 if fs->useOffset is false).
+ */
+static short computeFieldOffset(VSMotionDetect* md, VSMotionDetectFields* fs,
+                                const Field* field, Vec* offset) {
+  offset->x = 0;
+  offset->y = 0;
+  if(fs->useOffset){
+    // Todo: we could put the preparedtransform into fs
+    PreparedTransform pt = prepare_transform(&fs->offset, &md->fi);
+    Vec fieldpos = {field->x, field->y};
+    *offset = sub_vec(transform_vec(&pt, &fieldpos), fieldpos);
+    // is the field still in the frame
+    int s2 = field->size/2;
+    if(unlikely(fieldpos.x+offset->x-s2-fs->maxShift-fs->stepSize < 0 ||
+                fieldpos.x+offset->x+s2+fs->maxShift+fs->stepSize >= md->fi.width ||
+                fieldpos.y+offset->y-s2-fs->maxShift-fs->stepSize < 0 ||
+                fieldpos.y+offset->y+s2+fs->maxShift+fs->stepSize >= md->fi.height)){
+      return 0;
+    }
+  }
+  return 1;
+}
+
 /* calculates the optimal transformation for one field in Planar frames
  * (only luminance)
  */
@@ -392,20 +447,9 @@ LocalMotion calcFieldTransPlanar(VSMotionDetect* md, VSMotionDetectFields* fs,
   int maxShift = fs->maxShift;
   Vec offset = { 0, 0};
   LocalMotion lm = null_localmotion();
-  if(fs->useOffset){
-    // Todo: we could put the preparedtransform into fs
-    PreparedTransform pt = prepare_transform(&fs->offset, &md->fi);
-    Vec fieldpos = {field->x, field->y};
-    offset = sub_vec(transform_vec(&pt, &fieldpos), fieldpos);
-    // is the field still in the frame
-    int s2 = field->size/2;
-    if(unlikely(fieldpos.x+offset.x-s2-maxShift-stepSize < 0 ||
-                fieldpos.x+offset.x+s2+maxShift+stepSize >= md->fi.width ||
-                fieldpos.y+offset.y-s2-maxShift-stepSize < 0 ||
-                fieldpos.y+offset.y+s2+maxShift+stepSize >= md->fi.height)){
-      lm.match=-1;
-      return lm;
-    }
+  if(!computeFieldOffset(md, fs, field, &offset)){
+    lm.match=-1;
+    return lm;
   }
 
 #ifdef STABVERBOSE
@@ -702,6 +746,175 @@ VSVector selectfields(VSMotionDetect* md, VSMotionDetectFields* fs,
   return goodflds;
 }
 
+#ifdef USE_MPS
+// Fallback/seed fraction of the accepted fields processed concurrently on
+// the CPU while the GPU works on the rest (see
+// vsMPSBatchSearchSubmit()'s header comment for the rationale), used only
+// until vsMPSSuggestCPUShare() has enough measured timing data to replace
+// it with an estimate adapted to this machine's actual relative CPU/GPU
+// speed (see calcTransFieldsMPS()).
+#define VS_MPS_CPU_CONCURRENT_SHARE 0.25
+
+/* Batch variant of the per-field search loop below, using the Metal/MPS
+ * accelerator (md->mpsAccel) to search most "good" fields in one GPU
+ * dispatch, while a minority share is processed concurrently on the CPU
+ * (existing per-field spiral search, OMP-parallelized) instead of leaving
+ * CPU cores idle while the GPU dispatch is in flight -- see
+ * vsMPSBatchSearchSubmit()/Wait(). Uses the same computeFieldOffset() as
+ * calcFieldTransPlanar() so that the semantics of rejecting out-of-frame
+ * fields never diverge between the CPU and GPU paths.
+ * @return VS_OK on success (results appended to *localmotions),
+ *         VS_ERROR if the batch search failed (caller falls back to CPU
+ *         for the whole batch; nothing is appended to *localmotions in
+ *         this case, so there is no risk of duplicated field results)
+ */
+static int calcTransFieldsMPS(VSMotionDetect* md, VSMotionDetectFields* fields,
+                              calcFieldTransFunc fieldfunc,
+                              VSVector* goodflds, LocalMotions* localmotions) {
+  int n = vs_vector_size(goodflds);
+  if (n <= 0)
+    return VS_OK;
+
+  Field* mfields             = (Field*) vs_malloc(sizeof(Field) * n);
+  Vec* offsets                = (Vec*) vs_malloc(sizeof(Vec) * n);
+  double* contrasts           = (double*) vs_malloc(sizeof(double) * n);
+  int* origIndex               = (int*) vs_malloc(sizeof(int) * n);
+  VSMPSMotionResult* results  = (VSMPSMotionResult*) vs_malloc(sizeof(VSMPSMotionResult) * n);
+  if (!mfields || !offsets || !contrasts || !origIndex || !results) {
+    vs_log_error(md->conf.modName, "malloc failed!\n");
+    if(mfields)   vs_free(mfields);
+    if(offsets)   vs_free(offsets);
+    if(contrasts) vs_free(contrasts);
+    if(origIndex) vs_free(origIndex);
+    if(results)   vs_free(results);
+    return VS_ERROR;
+  }
+
+  int accepted = 0;
+  int index;
+  for(index=0; index < n; index++){
+    contrast_idx* ci = (contrast_idx*) vs_vector_get(goodflds, index);
+    const Field* field = &fields->fields[ci->index];
+    Vec offset;
+    if(!computeFieldOffset(md, fields, field, &offset))
+      continue; // field rejected (out of frame), same as the CPU path
+    mfields[accepted]   = *field;
+    offsets[accepted]   = offset;
+    contrasts[accepted] = ci->contrast;
+    origIndex[accepted] = ci->index;
+    accepted++;
+  }
+
+  int ret = VS_OK;
+  int gpuCount = accepted;
+  int cpuCount = 0;
+  // temporary holding pen for the CPU-concurrent share's results: kept
+  // separate from *localmotions until the GPU half also succeeds, so a
+  // GPU failure can be reported as a clean, all-or-nothing VS_ERROR (the
+  // caller then re-runs the *entire* batch on the CPU fallback path
+  // without risking duplicated entries for the fields we already did here).
+  VSVector cpuMotions;
+  vs_vector_init(&cpuMotions, 0);
+
+  if (accepted > 0) {
+    // The CPU/GPU overlap itself comes from vsMPSBatchSearchSubmit() not
+    // blocking, not from OMP -- even a single CPU thread processing this
+    // share while the GPU dispatch runs asynchronously in the background
+    // is genuine, valid concurrency. OMP (guarded below, around just the
+    // #pragma) is a separate, additional optimization that further
+    // parallelizes the CPU share itself across cores when available.
+    //
+    // The split ratio itself is adapted to this machine's measured
+    // relative CPU/GPU speed (see vsMPSReportBatchTiming() below), falling
+    // back to the fixed VS_MPS_CPU_CONCURRENT_SHARE heuristic until enough
+    // timing data has been collected. Coarse and fine get separate
+    // estimates (see VSMPSBatchKind) since their per-field costs are not
+    // comparable -- fine's window is small enough that fixed GPU dispatch
+    // overhead, not compute, tends to dominate.
+    VSMPSBatchKind batchKind = (fields == &md->fieldscoarse) ? VSMPSBatchCoarse : VSMPSBatchFine;
+    double cpuShare = vsMPSSuggestCPUShare((VSMPSAccel*)md->mpsAccel, batchKind, VS_MPS_CPU_CONCURRENT_SHARE);
+    cpuCount = (int)(accepted * cpuShare);
+    gpuCount = accepted - cpuCount;
+
+    // Generation tags identify the *content* currently held in md->curr /
+    // md->prev so the accelerator can skip re-uploading a plane it still
+    // has cached from a previous call -- md->curr is (re)filled exactly
+    // once per vsMotionDetection() invocation (tagged by md->frameNum at
+    // that time), and md->prev is always byte-identical to the previous
+    // invocation's md->curr (copied at the end of vsMotionDetection()).
+    // Both the coarse and fine batches within one frame therefore share the
+    // same two generations, and steady-state only the new "curr" plane
+    // needs a fresh upload each frame -- "prev" hits the cache.
+    uint64_t currGeneration = (uint64_t) md->frameNum;
+    uint64_t prevGeneration = (uint64_t) (md->frameNum - 1);
+
+    if (gpuCount > 0) {
+      ret = vsMPSBatchSearchSubmit((VSMPSAccel*)md->mpsAccel,
+                                   md->curr.data[0], md->curr.linesize[0],
+                                   md->prev.data[0], md->prev.linesize[0], md->fi.height,
+                                   mfields, offsets, gpuCount,
+                                   fields->maxShift, fields->stepSize,
+                                   currGeneration, prevGeneration);
+    }
+
+    struct timespec cpuStart, cpuEnd;
+    double cpuSeconds = 0.0;
+    if (ret == VS_OK && cpuCount > 0) {
+      clock_gettime(CLOCK_MONOTONIC, &cpuStart);
+#ifdef USE_OMP
+      omp_set_num_threads(md->conf.numThreads);
+#pragma omp parallel for shared(mfields, contrasts, origIndex, md, fields, fieldfunc, cpuMotions)
+#endif
+      for(index = gpuCount; index < accepted; index++){
+        LocalMotion m = fieldfunc(md, fields, &fields->fields[origIndex[index]], origIndex[index]);
+        if(m.match >= 0){
+          m.contrast = contrasts[index];
+#ifdef USE_OMP
+#pragma omp critical(localmotions_append_mps_cpu)
+#endif
+          vs_vector_append_dup(&cpuMotions, &m, sizeof(LocalMotion));
+        }
+      }
+      clock_gettime(CLOCK_MONOTONIC, &cpuEnd);
+      cpuSeconds = (cpuEnd.tv_sec - cpuStart.tv_sec) + (cpuEnd.tv_nsec - cpuStart.tv_nsec) / 1e9;
+    }
+
+    double gpuSeconds = 0.0;
+    if (ret == VS_OK && gpuCount > 0) {
+      ret = vsMPSBatchSearchWait((VSMPSAccel*)md->mpsAccel, results, gpuCount, &gpuSeconds);
+    }
+
+    if (ret == VS_OK) {
+      vsMPSReportBatchTiming((VSMPSAccel*)md->mpsAccel, batchKind, cpuSeconds, cpuCount, gpuSeconds, gpuCount);
+    }
+  }
+
+  if (ret == VS_OK) {
+    for(index=0; index < gpuCount; index++){
+      LocalMotion m = null_localmotion();
+      m.f = mfields[index];
+      m.v.x = results[index].x + offsets[index].x;
+      m.v.y = results[index].y + offsets[index].y;
+      m.match = ((double)results[index].minSAD)/(mfields[index].size*mfields[index].size);
+      m.contrast = contrasts[index];
+      vs_vector_append_dup(localmotions, &m, sizeof(LocalMotion));
+    }
+    for(index=0; index < vs_vector_size(&cpuMotions); index++){
+      vs_vector_append_dup(localmotions, vs_vector_get(&cpuMotions, index), sizeof(LocalMotion));
+    }
+  }
+  vs_vector_del(&cpuMotions);
+
+  vs_free(mfields);
+  vs_free(offsets);
+  vs_free(contrasts);
+  vs_free(origIndex);
+  vs_free(results);
+  return ret;
+}
+
+#endif
+
 /* tries to register current frame onto previous frame.
  *   Algorithm:
  *   discards fields with low contrast
@@ -725,6 +938,15 @@ LocalMotions calcTransFields(VSMotionDetect* md,
 #endif
 
   VSVector goodflds = selectfields(md, fields, contrastfunc);
+#ifdef USE_MPS
+  if (md->mpsAccel && md->fi.pFormat <= PF_PACKED && vs_vector_size(&goodflds) > 0) {
+    if (calcTransFieldsMPS(md, fields, fieldfunc, &goodflds, &localmotions) == VS_OK) {
+      vs_vector_del(&goodflds);
+      return localmotions;
+    }
+    vs_log_info(md->conf.modName, "MPS batch search failed, falling back to CPU\n");
+  }
+#endif
   // use all "good" fields and calculate optimal match to previous frame
   //MSVC requires the OpenMP loop index to be a signed integer, declared in the same function, and visible if not declared inside the loop.
   int index;

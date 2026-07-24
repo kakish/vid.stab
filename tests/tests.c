@@ -33,6 +33,9 @@
 #include "test_transform.c"
 #include "test_compareimg.c"
 #include "test_motiondetect.c"
+#ifdef USE_MPS
+#include "test_motiondetect_mps.c"
+#endif
 #include "test_store_restore.c"
 #include "test_contrast.c"
 #include "test_boxblur.c"
@@ -114,6 +117,12 @@ int main(int argc, char** argv){
   if(all || contains(argv,argc,"--testMD", "motionDetect")){
     UNIT(test_motionDetect(&testdata));
   }
+
+#ifdef USE_MPS
+  if(all || contains(argv,argc,"--testMDMPS", "motionDetect MPS consistency")){
+    UNIT(test_motionDetectMPS_consistency(&testdata));
+  }
+#endif
 
   if(all || contains(argv,argc,"--testLM", "localmotion2transform")){
     UNIT(test_localmotion2transform(&testdata));

@@ -40,6 +40,9 @@
 #define ASCII_SERIALIZATION_MODE 1
 #define BINARY_SERIALIZATION_MODE 2
 
+/** selects the acceleration backend used for motion detection */
+typedef enum {VSAccelAuto = 0, VSAccelCPU = 1, VSAccelMPS = 2} VSAccelMode;
+
 typedef struct VS_API _vsmotiondetectconfig {
   /* meta parameter for maxshift and fieldsize between 1 and 15 */
   int         shakiness;
@@ -53,6 +56,7 @@ typedef struct VS_API _vsmotiondetectconfig {
   double      contrastThreshold;
   const char* modName;          // module name (used for logging)
   int         numThreads;       // number of threads to use (automatically set if 0)
+  VSAccelMode accelMode;        // acceleration backend to use (default: VSAccelAuto)
 } VSMotionDetectConfig;
 
 /** structure for motion detection fields */
@@ -88,6 +92,11 @@ typedef struct VS_API _vsmotiondetect {
   int serializationMode;        // 1 if ascii and 2 if binary
 
   int frameNum;
+
+  void* mpsAccel;               // opaque Apple Metal/MPS acceleration context
+                                 // (NULL if unavailable, unused, or not built with USE_MPS);
+                                 // always present regardless of USE_MPS so the ABI does
+                                 // not differ between builds with/without it
 } VSMotionDetect;
 
 static const char vs_motiondetect_help[] = ""
